@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HMAC Integrity Checker</title>
+<style>
+  :root { --text: #1a1a1a; --muted: #666; --line: #d0d0d0; --green: #1b873f; --red: #c62828; --blue: #1f5fbf; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; background: #fff; color: var(--text);
+         font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  h1 { margin: 0 0 4px; font-size: 26px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  .keyrow { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  input, textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }
+  textarea { width: 100%; height: 70px; resize: vertical; }
+  button { font: inherit; padding: 8px 12px; border: 0; border-radius: 6px; background: var(--blue);
+           color: #fff; cursor: pointer; margin: 4px 4px 0 0; }
+  button:disabled { background: #aaa; cursor: default; }
+  button.warn { background: #b85c00; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .col { border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+  .col h2 { margin: 0 0 10px; font-size: 20px; }
+  .label { font-size: 13px; color: var(--muted); margin-top: 10px; }
+  .val { font-family: Consolas, "Courier New", monospace; font-size: 14px; word-break: break-all;
+         background: #f5f5f5; border-radius: 6px; padding: 6px 8px; min-height: 32px; }
+  .bad { color: var(--red); font-weight: bold; }
+  .track { position: relative; height: 40px; margin: 0 0 16px; border-bottom: 2px dashed var(--line); }
+  .packet { position: absolute; top: 4px; left: 0; padding: 6px 12px; background: var(--blue); color: #fff;
+            border-radius: 16px; font-size: 14px; opacity: 0;
+            transition: left 0.8s ease-in-out, opacity 0.3s, background 0.3s; }
+  .packet.evil { background: #b85c00; }
+  .tags { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .result { margin-top: 12px; padding: 14px; border-radius: 8px; text-align: center;
+            font-size: 24px; font-weight: bold; border: 2px solid var(--line); color: var(--muted); }
+  .result.ok { background: #e6f4ea; border-color: var(--green); color: var(--green); }
+  .result.fail { background: #fdecea; border-color: var(--red); color: var(--red); }
+  .log { margin-top: 16px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+  .log h2 { margin: 0 0 6px; font-size: 18px; }
+  .log ol { margin: 0; padding-left: 40px; max-height: 160px; overflow-y: auto;
+            font-family: Consolas, "Courier New", monospace; font-size: 14px; }
+  .log .ok { color: var(--green); } .log .fail { color: var(--red); }
+  .selftest { margin-top: 10px; font-size: 13px; color: var(--muted); }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } .track { display: none; } }
+</style>
+</head>
+<body>
+  <h1>Message Integrity Checker (HMAC-SHA256)</h1>
+  <p class="sub">Alice sends a message with an HMAC tag. Mallory sits on the network. Bob verifies using the shared secret key.</p>
+
+  <div class="keyrow">
+    <label for="key"><b>Shared secret key:</b></label>
+    <input id="key" value="secret123" size="20">
+    <span class="sub" style="margin:0">(known only to Alice and Bob)</span>
+  </div>
+
+  <div class="track"><div id="packet" class="packet">message + tag</div></div>
+
+  <div class="grid">
+    <div class="col">
+      <h2>Alice (sender)</h2>
+      <textarea id="msg">Pay Bob $100</textarea>
+      <button id="send">Send</button>
+      <div class="label">Message sent</div><div id="aMsg" class="val"></div>
+      <div class="label">HMAC tag (hex)</div><div id="aTag" class="val"></div>
+    </div>
+
+    <div class="col">
+      <h2>Mallory (network)</h2>
+      <div class="label">Intercepted message</div><div id="mMsg" class="val"></div>
+      <div class="label">Intercepted tag</div><div id="mTag" class="val"></div>
+      <button id="tamper" class="warn" disabled>Tamper (change one character)</button>
+      <button id="forge" class="warn" disabled>Forge (random tag)</button>
+    </div>
+
+    <div class="col">
+      <h2>Bob (receiver)</h2>
+      <div class="label">Received message</div><div id="bMsg" class="val"></div>
+      <div class="tags">
+        <div><div class="label">Received tag</div><div id="bRecv" class="val"></div></div>
+        <div><div class="label">Recomputed tag</div><div id="bCalc" class="val"></div></div>
+      </div>
+      <div id="result" class="result">Waiting...</div>
+    </div>
+  </div>
+
+  <div class="log">
+    <h2>Event log</h2>
+    <ol id="log" reversed></ol>
+    <div id="selftest" class="selftest"></div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const enc = new TextEncoder();
+  let inFlight = null;    // the {message, tag} packet Mallory last saw
+  let busy = false;       // ignore clicks while the animation runs
+
+  // ---------- Crypto (Web Crypto API) ----------
+
+  // HMAC-SHA256(key, message) -> 64 hex chars. Same result as integrity.make_tag in Python.
+  async function makeTag(key, message) {
+    // Step 1: encode key and message as UTF-8 bytes (Python uses .encode("utf-8")).
+    // Step 2: import the raw key bytes as an HMAC key that uses SHA-256.
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    // Step 3: compute HMAC = SHA256((K ^ opad) || SHA256((K ^ ipad) || message)).
+    const sig = await crypto.subtle.sign("HMAC", cryptoKey, enc.encode(message));
+    // Step 4: convert the 32-byte result to lowercase hex.
+    return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // Bob's check: recompute the tag and compare every character (constant time, no early exit).
+  function tagsEqual(a, b) {
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+  }
+
+  // A forged tag: 32 random bytes from the secure random generator, as hex.
+  function randomTag() {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // Change exactly one character (same rule as integrity.tamper in Python).
+  function tamperText(m) {
+    if (!m) return "X";
+    return (m[0] !== "X" ? "X" : "Y") + m.slice(1);
+  }
+
+  // ---------- UI helpers ----------
+
+  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  // Show `text`, marking in red every position that differs from `other`.
+  function highlight(text, other) {
+    return [...text].map((c, i) => (c !== other[i] ? `<span class="bad">${esc(c)}</span>` : esc(c))).join("");
+  }
+
+  function log(text, cls) {
+    const li = document.createElement("li");
+    li.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+    if (cls) li.className = cls;
+    $("log").prepend(li);
+  }
+
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Slide the packet to a position (0%, 50%, 100% = Alice, Mallory, Bob).
+  async function moveTo(pos, evil) {
+    const p = $("packet");
+    p.classList.toggle("evil", !!evil);
+    p.style.opacity = 1;
+    p.style.left = `calc(${pos}% - ${pos * 1.4}px)`;
+    await wait(850);
+  }
+
+  function setButtons() {
+    $("send").disabled = busy;
+    $("tamper").disabled = $("forge").disabled = busy || !inFlight;
+  }
+
+  // ---------- The three scenarios ----------
+
+  // Bob receives (message, tag), recomputes the tag with the shared key and decides.
+  async function deliverToBob(packet, scenario) {
+    await moveTo(100, scenario !== "Normal");
+    const expected = await makeTag($("key").value, packet.message);
+    const ok = tagsEqual(expected, packet.tag);
+    $("bMsg").innerHTML = highlight(packet.message, inFlight.original);
+    $("bRecv").innerHTML = highlight(packet.tag, expected);
+    $("bCalc").textContent = expected;
+    $("result").className = "result " + (ok ? "ok" : "fail");
+    $("result").textContent = ok ? "VERIFIED" : "REJECTED";
+    log(`${scenario}: Bob received "${packet.message}" -> ${ok ? "VERIFIED" : "REJECTED (tags differ)"}`,
+        ok ? "ok" : "fail");
+  }
+
+  async function run(action) {
+    if (busy) return;
+    busy = true; setButtons();
+    try { await action(); }
+    catch (e) { log("Error: " + e.message, "fail"); }
+    busy = false; setButtons();
+  }
+
+  // Normal: Alice signs and sends; Mallory only watches; Bob verifies.
+  $("send").onclick = () => run(async () => {
+    const message = $("msg").value;
+    const tag = await makeTag($("key").value, message);   // Alice computes the tag with the shared key
+    $("aMsg").textContent = message; $("aTag").textContent = tag;
+    log(`Alice sent "${message}" with tag ${tag.slice(0, 16)}...`);
+    const p = $("packet"); p.style.transition = "none"; p.style.left = "0"; p.offsetWidth; p.style.transition = "";
+    await moveTo(50);
+    inFlight = { message, tag, original: message };
+    $("mMsg").textContent = message; $("mTag").textContent = tag;
+    log("Mallory intercepted the packet and forwarded it unchanged");
+    await deliverToBob({ message, tag }, "Normal");
+  });
+
+  // Tampering: Mallory changes one character but keeps Alice's tag (she cannot recompute it without the key).
+  $("tamper").onclick = () => run(async () => {
+    const message = tamperText(inFlight.original);
+    $("mMsg").innerHTML = highlight(message, inFlight.original); $("mTag").textContent = inFlight.tag;
+    log(`Mallory changed the message to "${message}" (kept the original tag)`);
+    await moveTo(50, true);
+    await deliverToBob({ message, tag: inFlight.tag }, "Tampering");
+  });
+
+  // Forgery: Mallory keeps the message but replaces the tag with 256 random bits (guess chance 1 in 2^256).
+  $("forge").onclick = () => run(async () => {
+    const tag = randomTag();
+    $("mMsg").textContent = inFlight.original; $("mTag").textContent = tag;
+    log(`Mallory forged a random tag ${tag.slice(0, 16)}...`);
+    await moveTo(50, true);
+    await deliverToBob({ message: inFlight.original, tag }, "Forgery");
+  });
+
+  // Self-test: must equal the value printed by `python integrity.py`.
+  (async () => {
+    if (!window.crypto || !crypto.subtle) {
+      $("selftest").innerHTML = '<span class="bad">Web Crypto is not available in this browser.</span>';
+      $("send").disabled = true;
+      return;
+    }
+    const want = "6edb7e533ff92551f967bc02167127b93850a6ba3433efaca8bcfd24783b160d";
+    const got = await makeTag("secret123", "hello");
+    $("selftest").innerHTML = `Self-test HMAC("secret123", "hello") = ${got} ` +
+      (got === want ? "(matches Python)" : '<span class="bad">(does NOT match Python)</span>');
+  })();
+  setButtons();
+</script>
+</body>
+</html>
